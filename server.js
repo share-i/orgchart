@@ -27,29 +27,44 @@ app.get('/api/users', async (req, res) => {
     try {
         do {
             const url = `https://api360.yandex.net/directory/v1/org/${YANDEX_ORG_ID}/users?page=${page}&perPage=1000`;
-            const apiRes = await fetch(url, {
-                headers: {
-                    'Authorization': `OAuth ${YANDEX_API_TOKEN}`
-                }
-            });
+            console.log(`[YANDEX API] GET:`, url);
+            console.log(`[YANDEX API] Headers:`, { 'Authorization': `OAuth ${YANDEX_API_TOKEN}` });
+            let apiRes;
+            try {
+                apiRes = await fetch(url, {
+                    headers: {
+                        'Authorization': `OAuth ${YANDEX_API_TOKEN}`
+                    }
+                });
+            } catch (err) {
+                console.error('[YANDEX API] Ошибка сети или DNS:', err);
+                return res.status(500).json({ error: 'Ошибка сети или DNS при обращении к Яндекс API', details: err.message });
+            }
 
+            console.log(`[YANDEX API] Status:`, apiRes.status);
             if (!apiRes.ok) {
                 const errorText = await apiRes.text();
-                console.error('Yandex API Error:', errorText);
+                console.error('[YANDEX API] Error response:', errorText);
                 // Прерываем, если один из запросов неудачен
                 return res.status(apiRes.status).send(`Ошибка запроса к API Яндекса: ${errorText}`);
             }
 
-            const data = await apiRes.json();
+            let data;
+            try {
+                data = await apiRes.json();
+            } catch (err) {
+                console.error('[YANDEX API] Ошибка парсинга JSON:', err);
+                return res.status(500).json({ error: 'Ошибка парсинга JSON от Яндекс API', details: err.message });
+            }
+            console.log(`[YANDEX API] Получено пользователей:`, data.users ? data.users.length : 0, 'на странице', page);
             if (data.users && data.users.length > 0) {
                 allUsers = allUsers.concat(data.users);
             }
-            
             totalPages = data.pages || 1;
             page++;
 
         } while (page <= totalPages);
-        
+        console.log(`[YANDEX API] Всего пользователей собрано:`, allUsers.length);
         res.json(allUsers); 
     } catch (error) {
         console.error('Ошибка на сервере-прокси:', error);
