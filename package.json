@@ -1,0 +1,12 @@
+{
+  "name": "js",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "d3-org-chart": "github:joelcoxokc/org-chart#feat/drag",
+    "express": "^4.19.2"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

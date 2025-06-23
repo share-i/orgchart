@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-org-chart@3.1.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-flextree@2.1.2/build/d3-flextree.js"></script>
+
+<style type="text/css">
+  .chart-container {
+    position: relative;
+    height: 85vh;
+    width: 100%;
+    overflow: hidden;
+    border: 1px solid #ccc;
+    cursor: move;
+  }
+
+  .chart-container svg {
+    min-width: 100%;
+    min-height: 100%;
+  }
+
+  /* Стили для модального окна */
+  .modal {
+    display: none; 
+    position: fixed; 
+    z-index: 1000; 
+    left: 0;
+    top: 0;
+    width: 100%; 
+    height: 100%; 
+    overflow: auto; 
+    background-color: rgba(0,0,0,0.4);
+  }
+
+  .modal-content {
+    background-color: #fefefe;
+    margin: 10% auto;
+    padding: 20px;
+    border: 1px solid #888;
+    width: 80%;
+    max-width: 500px;
+    border-radius: 5px;
+  }
+
+  .modal-content h2 {
+    margin-top: 0;
+  }
+
+  .modal-content label {
+    display: block;
+    margin-top: 10px;
+    font-weight: bold;
+  }
+  
+  .modal-content input {
+    width: calc(100% - 16px);
+    padding: 8px;
+    margin-top: 5px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+  }
+  
+  .modal-buttons {
+    margin-top: 20px;
+    text-align: right;
+  }
+
+  .modal-buttons button {
+    padding: 10px 15px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+
+  #modal-save-btn {
+    background-color: #4CAF50;
+    color: white;
+  }
+
+  #modal-cancel-btn {
+    background-color: #f44336;
+    color: white;
+    margin-left: 10px;
+  }
+
+  .hide {
+    display: none;
+  }
+
+  .drag-enabled:not(.dragging-active) .node.draggable {
+    stroke: grey;
+    stroke-width: 3px;
+    stroke-dasharray: 2px;
+  }
+
+  .drag-enabled.dragging-active .droppable {
+    stroke: green;
+    stroke-width: 3px;
+    stroke-dasharray: 5px;
+  }
+
+  .node.dragging {
+    stroke-dasharray: 0 !important;
+    stroke-width: 0 !important;
+  }
+
+  .node.dragging .content-container {
+    background-color: #ffffff;
+  }
+</style>
+
+<script>
+  var chart = null;
+  let dragNode;
+  let dropNode;
+  let dragEnabled = false;
+  let dragStartX;
+  let dragStartY;
+  let isDragStarting = false;
+
+  let undoActions = [];
+  let redoActions = [];
+
+  async function fetchProxyUsers() {
+    const res = await fetch('/api/users'); // Запрос к нашему прокси
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`Ошибка загрузки данных с прокси-сервера: ${errorText}`);
+    }
+    return await res.json();
+  }
+
+  function buildOrgChartData(users) {
+    const emailMap = users.reduce((map, user) => {
+      map[user.email] = user;
+      return map;
+    }, {});
+    
+    const idMap = users.reduce((map, user) => {
+        map[user.id] = user;
+        return map;
+    }, {});
+
+
+    // Преобразуем в формат org chart, используя числовой ID и about для иерархии
+    let chartData = users.map(u => {
+      const manager = u.about ? emailMap[u.about] : null;
+      // Простое обнаружение цикла: сотрудник не может быть сам себе начальником
+      if (manager && manager.id === u.id) {
+          console.warn(`Обнаружена циклическая ссылка: ${u.name.first} ${u.name.last} является собственным руководителем. Связь удалена.`);
+          return { ...u, id: u.id, parentId: null };
+      }
+      return {
+        ...u, // Сохраняем все оригинальные данные
+        id: u.id, // Явный числовой ID
+        parentId: manager ? manager.id : null // Числовой ID родителя
+      };
+    });
+    
+    // Более сложная детекция циклов (A->B, B->A)
+    const dataMap = chartData.reduce((map, node) => (map[node.id] = node, map), {});
+    chartData.forEach(node => {
+        if (!node.parentId) return;
+        const visited = new Set();
+        let current = node;
+        while(current) {
+            if (visited.has(current.id)) {
+                console.warn('Обнаружен и разорван более сложный цикл в иерархии, начиная с узла:', node);
+                // Разрываем цикл
+                node.parentId = null; 
+                break;
+            }
+            visited.add(current.id);
+            current = dataMap[current.parentId];
+        }
+    });
+
+
+    // Решение проблемы "multiple roots": если корней несколько, создаем фиктивный общий
+    const roots = chartData.filter(node => !node.parentId);
+    if (roots.length > 1) {
+        console.warn(`Найдено ${roots.length} корневых узлов. Создаю фиктивный узел "Организация", чтобы построить диаграмму.`);
+        const dummyRoot = { 
+            id: 'dummy-root-id', 
+            name: {first: 'Организация'},
+            position: 'Корневой узел',
+            parentId: null 
+        };
+        chartData.unshift(dummyRoot);
+        roots.forEach(node => {
+            node.parentId = dummyRoot.id;
+        });
+    }
+
+    return chartData;
+  }
+
+  function onDragStart(element, dragEvent, node) {
+    dragNode = node;
+    const width = dragEvent.subject.width;
+    const half = width / 2;
+    const x = dragEvent.x - half;
+    dragStartX = x;
+    dragStartY = parseFloat(dragEvent.y);
+    isDragStarting = true;
+
+    d3.select(element).classed('dragging', true);
+  }
+
+  function onDrag(element, dragEvent) {
+    if (!dragNode) {
+      return;
+    }
+
+    const state = chart.getChartState();
+    const g = d3.select(element);
+
+    // This condition is designed to run at the start of a drag only
+    if (isDragStarting) {
+      isDragStarting = false;
+      document
+        .querySelector('.chart-container')
+        .classList.add('dragging-active');
+
+      // This sets the Z-Index above all other nodes, by moving the dragged node to be the last-child.
+      g.raise();
+
+      const descendants = dragEvent.subject.descendants();
+      const linksToRemove = [...(descendants || []), dragEvent.subject];
+      const nodesToRemove = descendants.filter(
+        (x) => x.data.id !== dragEvent.subject.id
+      );
+
+      // Remove all links associated with the dragging node
+      state['linksWrapper']
+        .selectAll('path.link')
+        .data(linksToRemove, (d) => state.nodeId(d))
+        .remove();
+
+      // Remove all descendant nodes associated with the dragging node
+      if (nodesToRemove) {
+        state['nodesWrapper']
+          .selectAll('g.node')
+          .data(nodesToRemove, (d) => state.nodeId(d))
+          .remove();
+      }
+    }
+
+    dropNode = null;
+    const cP = {
+      width: dragEvent.subject.width,
+      height: dragEvent.subject.height,
+      left: dragEvent.x,
+      right: dragEvent.x + dragEvent.subject.width,
+      top: dragEvent.y,
+      bottom: dragEvent.y + dragEvent.subject.height,
+      midX: dragEvent.x + dragEvent.subject.width / 2,
+      midY: dragEvent.y + dragEvent.subject.height / 2,
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const allNodes = d3.selectAll('g.node:not(.dragging)');
+    allNodes.select('rect').attr('fill', 'none');
+
+    allNodes
+      .filter(function (d2, i) {
+        const cPInner = {
+          left: d2.x,
+          right: d2.x + d2.width,
+          top: d2.y,
+          bottom: d2.y + d2.height,
+        };
+
+        if (
+          cP.midX > cPInner.left &&
+          cP.midX < cPInner.right &&
+          cP.midY > cPInner.top &&
+          cP.midY < cPInner.bottom &&
+          this.classList.contains('droppable')
+        ) {
+          dropNode = d2;
+          return d2;
+        }
+      })
+      .select('rect')
+      .attr('fill', '#e4e1e1');
+
+    dragStartX += parseFloat(dragEvent.dx);
+    dragStartY += parseFloat(dragEvent.dy);
+    g.attr('transform', 'translate(' + dragStartX + ',' + dragStartY + ')');
+  }
+
+  function onDragEnd(element, dragEvent) {
+    document
+      .querySelector('.chart-container')
+      .classList.remove('dragging-active');
+
+    if (!dragNode) {
+      return;
+    }
+
+    d3.select(element).classed('dragging', false);
+
+    if (!dropNode) {
+      chart.render();
+      return;
+    }
+
+    if (dragEvent.subject.parent && dragEvent.subject.parent.id === dropNode.id) {
+      chart.render();
+      return;
+    }
+
+    // Обновляем данные в API
+    const userId = dragEvent.subject.id;
+    const newParentEmail = dropNode.data.email;
+    const updatedData = { about: newParentEmail };
+
+    fetch(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedData)
+    })
+    .then(response => {
+        if (!response.ok) {
+            return response.text().then(text => { throw new Error(text) });
+        }
+        // После успешного обновления API, перезагружаем диаграмму
+        initialLoad();
+    })
+    .catch(error => {
+        console.error('Ошибка при обновлении руководителя через drag-n-drop:', error);
+        alert(`Не удалось изменить руководителя: ${error.message}`);
+        chart.render(); // Возвращаем диаграмму в исходное состояние
+    });
+  }
+
+  function enableDrag() {
+    dragEnabled = true;
+    document.querySelector('.chart-container').classList.add('drag-enabled');
+    document.getElementById('enableDragButton').classList.add('hide');
+    document.getElementById('dragActions').classList.remove('hide');
+  }
+
+  function disableDrag() {
+    dragEnabled = false;
+    document.querySelector('.chart-container').classList.remove('drag-enabled');
+    document.getElementById('enableDragButton').classList.remove('hide');
+    document.getElementById('dragActions').classList.add('hide');
+    undoActions = [];
+    redoActions = [];
+    updateDragActions();
+  }
+
+  function cancelDrag() {
+    if (undoActions.length === 0) {
+      disableDrag();
+      return;
+    }
+
+    const data = chart.getChartState().data;
+    undoActions.reverse().forEach((action) => {
+      const node = data.find((x) => x.id === action.id);
+      node.parentId = action.parentId;
+    });
+
+    disableDrag();
+    chart.render();
+  }
+
+  function undo() {
+    const action = undoActions.pop();
+    if (action) {
+      const node = chart.getChartState().data.find((x) => x.id === action.id);
+      const currentParentId = node.parentId;
+      const previousParentId = action.parentId;
+      action.parentId = currentParentId;
+      node.parentId = previousParentId;
+
+      redoActions.push(action);
+      chart.render();
+      updateDragActions();
+    }
+  }
+
+  function redo() {
+    const action = redoActions.pop();
+    if (action) {
+      const node = chart.getChartState().data.find((x) => x.id === action.id);
+      const currentParentId = node.parentId;
+      const previousParentId = action.parentId;
+      action.parentId = currentParentId;
+      node.parentId = previousParentId;
+      undoActions.push(action);
+      chart.render();
+      updateDragActions();
+    }
+  }
+
+  function updateDragActions() {
+    if (undoActions.length > 0) {
+      const undoButton = document.getElementById('undoButton');
+      undoButton.disabled = false;
+    } else {
+      undoButton.disabled = true;
+    }
+
+    if (redoActions.length > 0) {
+      const redoButton = document.getElementById('redoButton');
+      redoButton.disabled = false;
+    } else {
+      redoButton.disabled = true;
+    }
+  }
+
+  function generateContent(d) {
+    const color = '#FFFFFF';
+    const imageDiffVert = 25 + 2;
+    const avatarUrl = d.data.avatarId ? `https://avatars.yandex.net/get-yapic/${d.data.avatarId}/islands-150` : '';
+    const displayName = d.data.name ? [d.data.name.first, d.data.name.last].filter(Boolean).join(' ') : d.data.nickname;
+    return `
+      <div class="node-container" style='
+      width:${d.width}px;
+      height:${d.height}px;
+      padding-top:${imageDiffVert - 2}px;
+      padding-left:1px;
+      padding-right:1px'>
+              <div class="content-container" style="font-family: 'Inter', sans-serif;  margin-left:-1px;width:${
+                d.width - 2
+              }px;height:${
+      d.height - imageDiffVert
+    }px;border-radius:10px;border: ${
+      d.data._highlighted || d.data._upToTheRootHighlighted
+        ? '5px solid #E27396"'
+        : '1px solid #E4E2E9"'
+    } >
+                  <div style="display:flex;justify-content:flex-end;margin-top:5px;margin-right:8px">#${
+                    d.data.id
+                  }</div>
+                  <div  style="margin-top:${
+                    -imageDiffVert - 20
+                  }px;margin-left:${15}px;border-radius:100px;width:50px;height:50px;" ></div>
+                  <div style="margin-top:${
+                    -imageDiffVert - 20
+                  }px;">   <img src="${avatarUrl}" style="margin-left:${20}px;border-radius:100px;width:40px;height:40px;${avatarUrl ? '' : 'display:none;'}" /></div>
+                  <div style="font-size:15px;color:#08011E;margin-left:20px;margin-top:10px">  ${
+                    displayName
+                  } </div>
+                  <div style="color:#716E7B;margin-left:20px;margin-top:3px;font-size:10px;"> ${
+                    d.data.position
+                  } </div>
+                   <div style="color:#716E7B;margin-left:20px;margin-top:3px;font-size:10px;"> 
+                    <a href="mailto:${d.data.email}" style="color:inherit; text-decoration: none;" onclick="event.stopPropagation();">${d.data.email}</a>
+                   </div>
+                   <div style="color:#716E7B;margin-left:20px;margin-top:3px;font-size:10px;"> Dept: ${
+                    d.data.departmentId || 'N/A'
+                  } </div>
+
+              </div>
+          </div>
+      `;
+  }
+
+  function handleNodeClick(node) {
+    const user = node;
+    document.getElementById('edit-modal-title').innerText = `Редактировать: ${user.name.first} ${user.name.last}`;
+    document.getElementById('edit-user-id').value = user.id;
+    document.getElementById('edit-first-name').value = user.name.first || '';
+    document.getElementById('edit-last-name').value = user.name.last || '';
+    document.getElementById('edit-position').value = user.position || '';
+    document.getElementById('edit-about').value = user.about || '';
+    document.getElementById('edit-modal').style.display = 'block';
+  }
+
+  function closeModal() {
+    document.getElementById('edit-avatar').value = ''; // Очищаем поле файла
+    document.getElementById('edit-modal').style.display = 'none';
+  }
+
+  async function handleSaveChanges() {
+    const userId = document.getElementById('edit-user-id').value;
+    const avatarInput = document.getElementById('edit-avatar');
+    const avatarFile = avatarInput.files[0];
+
+    const updatedData = {
+      name: {
+        first: document.getElementById('edit-first-name').value,
+        last: document.getElementById('edit-last-name').value
+      },
+      position: document.getElementById('edit-position').value,
+      about: document.getElementById('edit-about').value
+    };
+
+    try {
+      const response = await fetch(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(updatedData)
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Ошибка сохранения данных: ${errorText}`);
+      }
+      
+      // Если выбран новый аватар, загружаем его
+      if (avatarFile) {
+          const avatarResponse = await fetch(`/api/users/${userId}/avatar`, {
+              method: 'PUT',
+              headers: {
+                  'Content-Type': avatarFile.type
+              },
+              body: avatarFile
+          });
+
+          if (!avatarResponse.ok) {
+              const errorText = await avatarResponse.text();
+              throw new Error(`Ошибка загрузки аватара: ${errorText}`);
+          }
+      }
+
+      closeModal();
+      // Перезагружаем все данные для чистоты
+      initialLoad();
+      
+    } catch (error) {
+      alert(error.message);
+    }
+  }
+
+  // Обернем всю логику загрузки в одну функцию для переиспользования
+  function renderChart(usersToRender) {
+    console.log('Шаг 1: Получены пользователи для рендера', usersToRender);
+      
+      const data = buildOrgChartData(usersToRender);
+      console.log('Шаг 2: Данные преобразованы для диаграммы', data);
+
+      if (!data || data.length === 0) {
+        console.error("Нет данных для отображения. Проверьте ответ от API.");
+        document.querySelector('.chart-container').innerHTML = '<p style="color:red; text-align:center;">Не удалось загрузить данные для диаграммы.</p>';
+        return;
+      }
+
+      try {
+        console.log('Шаг 3: Начинаем отрисовку диаграммы');
+        if (chart) {
+            chart.data(data).render();
+        } else {
+             chart = new d3.OrgChart()
+              .nodeHeight((d) => 125) // Стандартная высота для всех
+              .nodeWidth((d) => 220 + 2)
+              .childrenMargin((d) => 50)
+              .compactMarginBetween((d) => 35)
+              .compactMarginPair((d) => 30)
+              .neighbourMargin((a, b) => 20)
+              .onNodeClick(d => handleNodeClick(d.data)) 
+              .nodeContent(function (d, i, arr, state) {
+                return generateContent(d);
+              })
+              .nodeEnter(function (node) {
+                d3.select(this).call(
+                  d3
+                    .drag()
+                    .filter(function (x, node) {
+                      return dragEnabled && this.classList.contains('draggable');
+                    })
+                    .on('start', function (d, node) {
+                      onDragStart(this, d, node);
+                    })
+                    .on('drag', function (dragEvent, node) {
+                      onDrag(this, dragEvent);
+                    })
+                    .on('end', function (d) {
+                      onDragEnd(this, d);
+                    })
+                );
+              })
+              .nodeUpdate(function (d) {
+                d3.select(this).classed('droppable', true);
+                d3.select(this).classed('draggable', true);
+              })
+              .container('.chart-container')
+              .data(data)
+              .render();
+        }
+        console.log('Шаг 4: Отрисовка диаграммы успешно завершена');
+      } catch (error) {
+        console.error('Ошибка при отрисовке диаграммы:', error);
+        document.querySelector('.chart-container').innerHTML = `<p style="color:red; text-align:center;">Произошла ошибка при отрисовке диаграммы. Подробности в консоли.</p>`;
+      }
+  }
+
+  async function initialLoad() {
+    try {
+        const users = await fetchProxyUsers();
+        renderChart(users);
+    } catch(error) {
+        console.error('Не удалось получить или обработать данные:', error);
+    }
+  }
+
+  // Инициализация при первой загрузке
+  document.addEventListener('DOMContentLoaded', initialLoad);
+
+</script>
+
+<body>
+
+  <button id="enableDragButton" onclick="enableDrag()">Organize</button>
+  <div id="dragActions" class="hide">
+    <button id="finishDrag" onclick="disableDrag()">Done</button>
+    <button id="undoButton" disabled onclick="undo()">Undo</button>
+    <button id="redoButton" disabled onclick="redo()">Redo</button>
+    <button id="cancelDrag" onclick="cancelDrag()">Cancel</button>
+  </div>
+  
+  <div class="chart-container"></div>
+  
+  <!-- HTML для модального окна -->
+  <div id="edit-modal" class="modal">
+    <div class="modal-content">
+      <h2 id="edit-modal-title">Редактировать сотрудника</h2>
+      <input type="hidden" id="edit-user-id">
+      
+      <label for="edit-first-name">Имя:</label>
+      <input type="text" id="edit-first-name">
+      
+      <label for="edit-last-name">Фамилия:</label>
+      <input type="text" id="edit-last-name">
+      
+      <label for="edit-position">Должность:</label>
+      <input type="text" id="edit-position">
+  
+      <label for="edit-about">Email руководителя:</label>
+      <input type="text" id="edit-about">
+  
+      <label for="edit-avatar">Новый аватар (PNG, JPG):</label>
+      <input type="file" id="edit-avatar" accept="image/png, image/jpeg">
+  
+      <div class="modal-buttons">
+        <button id="modal-save-btn" onclick="handleSaveChanges()">Сохранить</button>
+        <button id="modal-cancel-btn" onclick="closeModal()">Отмена</button>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
